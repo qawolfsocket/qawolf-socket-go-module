@@ -1,0 +1,81 @@
+name: Publish GO Module Version
+
+# Publishes a fresh version of this GO module for Socket coverage.
+#
+# Why this exists / why it is NOT `on: release: published` (unlike the rubygems
+# gem-push workflow): a GO module has no registry that stamps a publish time —
+# proxy.golang.org dates a version by its TAGGED COMMIT. Re-tagging the repo's
+# existing (stale) HEAD therefore yields a stale publish time, and Socket never
+# flags the version `recentlyPublished`. A `release: published` trigger is also
+# too late: the tag already points at the stale commit and the test's proxy poll
+# would cache it stale before we could move it. So this workflow creates a BRAND
+# NEW commit and tags THAT — giving the version a genuinely current publish time.
+#
+# The Socket suite triggers it via the GitHub API (workflow_dispatch); it can
+# also be run by hand from the Actions tab.
+
+on:
+  workflow_dispatch:
+
+# Serialize runs so two dispatches can't race on the version bump.
+concurrency:
+  group: go-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full history (need all tags for the version bump)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "qawolf-socket-bot"
+          git config user.email "qawolf-socket-bot@users.noreply.github.com"
+
+      - name: Compute next version (patch bump — mirrors getNextVersion)
+        id: version
+        run: |
+          LATEST=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          BASE=${LATEST#v}
+          IFS=. read -r MAJOR MINOR PATCH <<< "${BASE:-0.0.0}"
+          PATCH=$((PATCH + 1))
+          if [ "$PATCH" -gt 999 ]; then PATCH=0; MINOR=$((MINOR + 1)); fi
+          if [ "$MINOR" -gt 999 ]; then MINOR=0; MAJOR=$((MAJOR + 1)); fi
+          VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Publishing ${VERSION} (previous: ${LATEST:-<none>})"
+
+      - name: Create a fresh commit so proxy.golang.org sees a current publish time
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # A content change gives the commit a current timestamp; proxy.golang.org
+          # reports THIS commit's time as the version's publish time.
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > RELEASED_AT
+          git add RELEASED_AT
+          git commit -m "Publish ${VERSION}"
+          git push origin HEAD:main
+
+      - name: Tag the fresh commit and push
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git tag "${VERSION}"
+          git push origin "refs/tags/${VERSION}"
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "${VERSION}" \
+            --title "Release ${VERSION}" \
+            --notes "Automated fresh publish for Socket coverage" \
+            --target main
